@@ -1,0 +1,7 @@
+node_modules/
+dist/
+sidecar/build/
+src-tauri/target/
+src-tauri/binaries/*
+.dev-data/
+ui-test-output/
