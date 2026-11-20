@@ -6,8 +6,9 @@ const root = process.cwd();
 await fs.mkdir(path.join(root, 'sidecar/build'), { recursive: true });
 await fs.mkdir(path.join(root, 'src-tauri/binaries'), { recursive: true });
 const bundle = path.join(root, 'sidecar/build/worker.cjs');
+const contentWorker = await build({ entryPoints: ['sidecar/content-worker.mjs'], bundle: true, platform: 'node', target: 'node22', format: 'cjs', write: false });
 await build({ entryPoints: ['sidecar/main.mjs'], outfile: bundle, bundle: true, platform: 'node', target: 'node22', format: 'cjs',
-  define: { 'import.meta.url': 'undefined' }, minify: false, sourcemap: false });
+  define: { 'import.meta.url': 'undefined', __CONTENT_WORKER_SOURCE__: JSON.stringify(contentWorker.outputFiles[0].text) }, minify: false, sourcemap: false });
 if (!process.argv.includes('--bundle-only')) {
   const targets = { win32: ['node22-win-x64', 'x86_64-pc-windows-msvc.exe'],
     linux: ['node22-linux-x64', 'x86_64-unknown-linux-gnu'], darwin: ['node22-macos-x64', 'x86_64-apple-darwin'] };

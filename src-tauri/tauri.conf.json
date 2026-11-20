@@ -19,7 +19,22 @@
         "minWidth": 960,
         "minHeight": 660,
         "center": true,
-        "backgroundColor": "#f7f8f4",
+        "backgroundColor": "#ffffff",
+        "dragDropEnabled": false
+      },
+      {
+        "label": "quick",
+        "title": "Clean_folder — Quick access",
+        "url": "index.html?quick=1",
+        "width": 460,
+        "height": 620,
+        "minWidth": 420,
+        "minHeight": 520,
+        "center": true,
+        "visible": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "backgroundColor": "#ffffff",
         "dragDropEnabled": false
       }
     ],

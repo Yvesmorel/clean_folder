@@ -1,0 +1,11 @@
+{
+  "identifier": "quick-capability",
+  "description": "Quick access uses the main window engine and a folder picker.",
+  "windows": [
+    "quick"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
+}

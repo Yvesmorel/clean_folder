@@ -1,7 +1,7 @@
 {
   "identifier": "main-capability", "description": "Native folder picker and the bundled engine only", "windows": ["main"],
   "permissions": [
-    "core:default", "dialog:allow-open",
+    "core:default", "core:window:allow-destroy", "dialog:allow-open",
     { "identifier": "shell:allow-spawn", "allow": [{ "name": "binaries/clean-folder-worker", "sidecar": true, "args": ["--serve"] }] },
     "shell:allow-stdin-write", "shell:allow-kill",
     { "identifier": "opener:allow-open-path", "allow": [{ "path": "**" }] }

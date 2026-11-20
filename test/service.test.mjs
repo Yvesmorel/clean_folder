@@ -7,13 +7,13 @@ import http from 'node:http';
 import { Store } from '../sidecar/store.mjs';
 import { Service } from '../sidecar/service.mjs';
 import { createPlan as enginePlan, applyPlan } from '../sidecar/engine.mjs';
-import { pullModel, validModel } from '../sidecar/runtime.mjs';
+import { pullModel, deleteModel, validModel } from '../sidecar/runtime.mjs';
 
 const models = [{ name: 'qwen3-embedding:0.6b', capabilities: ['embedding'], size: 639000000 },
   { name: 'llama3.2:1b', capabilities: ['completion'], size: 1100000000 }];
 async function fixture(t, extra = {}) {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'clean-folder-service-'));
-  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  t.after(() => fs.rm(base, { recursive: true, force: true, maxRetries: 3 }));
   const first = path.join(base, 'first'), second = path.join(base, 'second');
   await fs.mkdir(first); await fs.mkdir(second);
   await fs.writeFile(path.join(first, 'course.pdf'), 'course'); await fs.writeFile(path.join(first, 'invoice.pdf'), 'invoice');
@@ -172,4 +172,155 @@ test('thinking is disabled for supported naming models to preserve the short JSO
       client: { stats: {}, embedNames: async (names) => names.map(() => [1, 0]), chooseFolder: async () => 'Files' } }); } });
   await f.service.handle('create_plan', { directories: [f.first] });
   assert.equal(options.thinkingSupported, true);
+});
+
+
+test('deleting a selected model chooses an installed local compatible replacement and persists it', async (t) => {
+  let installed = [...models, { name: 'remote:latest', local: false, capabilities: ['completion'] }, { name: 'replacement:1b', capabilities: ['completion'] }];
+  const deleted = [];
+  const f = await fixture(t, { getModels: async () => installed, deleteModel: async (name) => { deleted.push(name); installed = installed.filter((m) => m.name !== name); } });
+  const result = await f.service.handle('delete_model', { name: 'llama3.2:1b' });
+  assert.deepEqual(deleted, ['llama3.2:1b']); assert.equal(result.ready, true);
+  assert.equal(result.settings.model, 'replacement:1b');
+  assert.equal(result.models.some((m) => m.name === 'llama3.2:1b'), false);
+  const restored = await new Store(f.store.directory).init();
+  assert.equal(restored.state.settings.model, 'replacement:1b'); assert.equal(restored.state.setup.autoSetupDisabled, true);
+});
+
+test('deleting the last embedding model disables analysis and preserves a prepared review', async (t) => {
+  let installed = [...models];
+  const f = await fixture(t, { getModels: async () => installed, deleteModel: async (name) => { installed = installed.filter((m) => m.name !== name); } });
+  const plan = await f.service.handle('create_plan', { directories: [f.first] });
+  const result = await f.service.handle('delete_model', { name: 'qwen3-embedding:0.6b' });
+  assert.equal(result.ready, false); assert.equal(result.currentPlan.id, plan.id);
+  assert.equal((await new Store(f.store.directory).init()).state.setup.autoSetupDisabled, true);
+  const applied = await f.service.handle('apply_plan', { planId: plan.id, revision: plan.revision });
+  assert.equal(applied.run.moved, 2);
+});
+
+test('model deletion rejects unknown names, concurrent tasks and propagates Ollama failure', async (t) => {
+  let calls = 0;
+  const f = await fixture(t, { deleteModel: async () => { calls++; throw new Error('Ollama refused deletion'); } });
+  await assert.rejects(f.service.handle('delete_model', { name: 'unknown:1b' }), /no longer installed/);
+  await assert.rejects(f.service.handle('delete_model', { name: '../bad' }), /valid Ollama/);
+  f.service.active = 'analysis';
+  await assert.rejects(f.service.handle('delete_model', { name: 'llama3.2:1b' }), /Please wait/);
+  f.service.active = null;
+  await assert.rejects(f.service.handle('delete_model', { name: 'llama3.2:1b' }), /Ollama refused deletion/);
+  assert.equal(calls, 1); assert.equal(f.service.active, null);
+  assert.equal(f.store.state.settings.model, 'llama3.2:1b'); assert.equal(f.store.state.setup.autoSetupDisabled, undefined);
+});
+
+test('deletion uses the Ollama DELETE endpoint with the exact model and accepts an empty success response', async (t) => {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    requests.push({ method: req.method, url: req.url, body: JSON.parse(body) });
+    if (requests.length === 1) { res.writeHead(200); res.end(); }
+    else { res.writeHead(500); res.end('Delete failed'); }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  await deleteModel('custom:1b', { base });
+  assert.deepEqual(requests[0], { method: 'DELETE', url: '/api/delete', body: { model: 'custom:1b' } });
+  await assert.rejects(deleteModel('custom:1b', { base }), /HTTP 500: Delete failed/);
+});
+
+test('visibility shortcut is validated, persisted and can be cleared', async (t) => {
+  const f = await fixture(t);
+  await f.service.handle('save_settings', { settings: { visibilityShortcut: 'Control+Alt+K' } });
+  assert.equal((await new Store(f.store.directory).init()).state.settings.visibilityShortcut, 'Control+Alt+K');
+  for (const visibilityShortcut of ['K', 'Shift+K', 'Control+Control+K', 'Control+Bogus', null, 2]) {
+    await assert.rejects(f.service.handle('save_settings', { settings: { visibilityShortcut } }));
+  }
+  assert.equal(f.store.state.settings.visibilityShortcut, 'Control+Alt+K');
+  await f.service.handle('save_settings', { settings: { visibilityShortcut: '' } });
+  assert.equal((await new Store(f.store.directory).init()).state.settings.visibilityShortcut, '');
+});
+
+
+test('cancelling analysis interrupts pending work and leaves no partial plan or moves', async (t) => {
+  let entered;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const f = await fixture(t, { createPlan: async (_, __, { signal }) => {
+    entered(); return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const work = f.service.handle('create_plan', { directories: [f.first] }); await ready;
+  assert.deepEqual(await f.service.handle('cancel_analysis'), { cancelled: true });
+  assert.deepEqual(await work, { cancelled: true }); assert.equal(f.service.active, null);
+  assert.equal(f.store.state.currentPlan, null); assert.deepEqual(f.store.state.recentDirectories, []);
+  assert.deepEqual((await fs.readdir(f.first)).sort(), ['course.pdf', 'invoice.pdf']);
+  assert.deepEqual(await f.service.handle('cancel_analysis'), { cancelled: false });
+  f.service.dependencies.createPlan = f.dependencies.createPlan = async (directory, options, hooks) => enginePlan(directory, options, { ...hooks,
+    client: { stats: {}, embedNames: async (names) => names.map(() => [1, 0]), chooseFolder: async () => 'Files' } });
+  assert.equal((await f.service.handle('create_plan', { directories: [f.first] })).status, 'draft');
+});
+test('cancellation while checking models stops before reading any directory', async (t) => {
+  let entered;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const f = await fixture(t, { getModels: async ({ signal }) => { entered(); return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } });
+  const work = f.service.handle('create_plan', { directories: [f.first] }); await ready;
+  await f.service.handle('cancel_analysis'); assert.deepEqual(await work, { cancelled: true }); assert.equal(f.calls.analyses, 0);
+});
+test('theme and content preferences persist and invalid settings are rejected', async (t) => {
+  const f = await fixture(t);
+  await f.service.handle('save_settings', { settings: { theme: 'black', inspectContent: false } });
+  const restored = await new Store(f.store.directory).init();
+  assert.equal(restored.state.settings.theme, 'black'); assert.equal(restored.state.settings.inspectContent, false);
+  await assert.rejects(f.service.handle('save_settings', { settings: { theme: 'blue' } }));
+  await assert.rejects(f.service.handle('save_settings', { settings: { inspectContent: 'yes' } }));
+});
+
+test('quick-access shortcut is migrated, validated and persisted separately from window visibility', async (t) => {
+  const f = await fixture(t);
+  assert.equal(f.store.state.settings.quickAccessShortcut, 'Control+Alt+Space');
+  await f.service.handle('save_settings', { settings: { visibilityShortcut: 'Control+Alt+K', quickAccessShortcut: 'Control+Alt+J' } });
+  const restored = await new Store(f.store.directory).init();
+  assert.equal(restored.state.settings.quickAccessShortcut, 'Control+Alt+J');
+  await assert.rejects(f.service.handle('save_settings', { settings: { quickAccessShortcut: 'Alt+Control+K' } }), /different/);
+  assert.equal(f.store.state.settings.quickAccessShortcut, 'Control+Alt+J');
+  await f.service.handle('save_settings', { settings: { quickAccessShortcut: '' } });
+  assert.equal(f.store.state.settings.visibilityShortcut, 'Control+Alt+K');
+});
+
+test('shutdown cancels analysis, saves local state and rejects new work', async (t) => {
+  let entered; const ready = new Promise((resolve) => { entered = resolve; });
+  const f = await fixture(t, { createPlan: async (_, __, { signal }) => {
+    entered(); return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const analysis = f.service.handle('create_plan', { directories: [f.first] }); await ready;
+  assert.deepEqual(await f.service.handle('shutdown'), { readyToClose: true });
+  assert.deepEqual(await analysis, { cancelled: true }); assert.equal(f.service.active, null);
+  assert.equal((await new Store(f.store.directory).init()).state.currentPlan, null);
+  await assert.rejects(f.service.handle('create_plan', { directories: [f.first] }), /closing/);
+  assert.deepEqual((await fs.readdir(f.first)).sort(), ['course.pdf', 'invoice.pdf']);
+});
+test('shutdown during file moves waits for the current receipt and stops before the next file', async (t) => {
+  let entered, release; const ready = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; }); let receipts = 0;
+  const f = await fixture(t, { applyPlan: async (plan, hooks) => applyPlan(plan, { ...hooks, onFileResult: async (entry) => {
+    await hooks.onFileResult(entry); if (++receipts === 1) { entered(); await gate; }
+  } }) });
+  const plan = await f.service.handle('create_plan', { directories: [f.first] });
+  const moving = f.service.handle('apply_plan', { planId: plan.id, revision: plan.revision }).catch((error) => error);
+  await ready;
+  let closed = false; const closing = f.service.handle('shutdown').then((result) => { closed = true; return result; });
+  await Promise.resolve(); assert.equal(closed, false);
+  release(); assert.equal((await moving).name, 'AbortError');
+  assert.deepEqual(await closing, { readyToClose: true });
+  const restored = await new Store(f.store.directory).init();
+  assert.equal(restored.state.history[0].entries.length, 1); assert.equal(restored.state.history[0].entries[0].ok, true);
+  assert.equal(restored.state.history[0].status, 'interrupted'); assert.equal(restored.state.history[0].moved, 1);
+  assert.equal((await fs.readdir(f.first)).filter((name) => name.endsWith('.pdf')).length, 1);
+});
+test('shutdown cancels setup and waits for the operation to release the engine', async (t) => {
+  let entered; const ready = new Promise((resolve) => { entered = resolve; });
+  const f = await fixture(t, { setupRuntime: async (_, __, ___, { signal }) => {
+    entered(); return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const setup = f.service.handle('setup_runtime').catch((error) => error); await ready;
+  assert.deepEqual(await f.service.handle('shutdown'), { readyToClose: true });
+  assert.equal((await setup).name, 'AbortError'); assert.equal(f.service.active, null);
+  assert.match((await new Store(f.store.directory).init()).state.setup.error, /cancelled/);
 });

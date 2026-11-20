@@ -4,7 +4,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const defaultSettings = { embeddingModel: 'qwen3-embedding:0.6b', model: 'llama3.2:1b',
-  threshold: 0.7, batchSize: 32, maxTokens: 64, folderLanguage: 'French' };
+  threshold: 0.7, batchSize: 32, maxTokens: 64, folderLanguage: 'English', visibilityShortcut: '',
+  theme: 'white', inspectContent: true, quickAccessShortcut: 'Control+Alt+Space' };
 export function dataDirectory() {
   return process.env.CLEAN_FOLDER_DATA_DIR || (process.platform === 'win32'
     ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'Clean_folder')

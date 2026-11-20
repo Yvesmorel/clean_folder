@@ -11,21 +11,25 @@ export function validModel(name) {
   if (/:.*cloud$/iu.test(name)) throw new Error('Choose a local model tag. Clean_folder uses models that run on this device.');
   return name;
 }
-export async function ollamaRequest(endpoint, payload, { base = BASE, timeout = 120000, signal } = {}) {
-  const response = await fetch(`${base}${endpoint}`, { method: payload === undefined ? 'GET' : 'POST',
+export async function ollamaRequest(endpoint, payload, { base = BASE, timeout = 120000, signal, method } = {}) {
+  const response = await fetch(`${base}${endpoint}`, { method: method ?? (payload === undefined ? 'GET' : 'POST'),
     headers: { 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload),
-    signal: signal ?? AbortSignal.timeout(timeout) });
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout) });
   if (!response.ok) throw new Error(`Ollama HTTP ${response.status}: ${(await response.text()).slice(0, 400)}`);
   return response;
 }
-export async function getModels({ base = BASE } = {}) {
-  const data = await (await ollamaRequest('/api/tags', undefined, { base, timeout: 3000 })).json();
+export async function deleteModel(name, { base = BASE } = {}) {
+  await ollamaRequest('/api/delete', { model: validModel(name) }, { base, method: 'DELETE' });
+}
+export async function getModels({ base = BASE, signal } = {}) {
+  const data = await (await ollamaRequest('/api/tags', undefined, { base, timeout: 3000, signal })).json();
   const models = [];
   for (const model of data.models ?? []) {
     let capabilities = [], local = !(model.remote_model || model.remote_host);
-    try { const details = await (await ollamaRequest('/api/show', { model: model.name }, { base, timeout: 15000 })).json();
+    signal?.throwIfAborted();
+    try { const details = await (await ollamaRequest('/api/show', { model: model.name }, { base, timeout: 15000, signal })).json();
       capabilities = details.capabilities ?? []; local = local && !(details.remote_model || details.remote_host);
-    } catch { /* Visible as unknown, never assumed to be usable. */ }
+    } catch { signal?.throwIfAborted(); /* Visible as unknown, never assumed to be usable. */ }
     models.push({ name: model.name, size: model.size, modifiedAt: model.modified_at,
       parameterSize: model.details?.parameter_size, capabilities, local });
   }
@@ -57,11 +61,12 @@ export async function pullModel(name, onProgress, { base = BASE, signal } = {}) 
   buffer += decoder.decode(); if (buffer.trim()) consume(buffer);
   if (!success) throw new Error('The model download ended before Ollama confirmed success. Retry to resume it.');
 }
-async function reachable() {
-  try { await ollamaRequest('/api/tags', undefined, { timeout: 2000 }); return true; } catch { return false; }
+async function reachable(signal) {
+  signal?.throwIfAborted();
+  try { await ollamaRequest('/api/tags', undefined, { timeout: 2000, signal }); return true; } catch { signal?.throwIfAborted(); return false; }
 }
-async function waitForServer() {
-  for (let i = 0; i < 60; i++) { if (await reachable()) return; await new Promise((r) => setTimeout(r, 500)); }
+async function waitForServer(signal) {
+  for (let i = 0; i < 60; i++) { if (await reachable(signal)) return; await new Promise((r) => setTimeout(r, 500)); }
   throw new Error('Ollama did not start. Retry setup or restart Windows.');
 }
 function execute(program, args) {
@@ -71,21 +76,23 @@ function execute(program, args) {
     child.on('error', reject); child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Dependency installation failed (${code}). ${output}`)));
   });
 }
-async function startOllama(executable, log) {
+async function startOllama(executable, log, signal) {
+  signal?.throwIfAborted();
   const child = spawn(executable, ['serve'], { detached: true, windowsHide: true, stdio: 'ignore' });
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-  child.unref(); log('info', 'Starting the local Ollama service.'); await waitForServer();
+  child.unref(); log('info', 'Starting the local Ollama service.'); await waitForServer(signal);
 }
-async function installOllama(directory, log, progress) {
+async function installOllama(directory, log, progress, signal) {
+  signal?.throwIfAborted();
   if (process.platform !== 'win32') {
     throw new Error('Automatic Ollama installation is available on Windows x64. Install Ollama manually on this development system.');
   }
   const executable = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe');
-  try { await fs.access(executable); await startOllama(executable, log); return; }
+  try { await fs.access(executable); await startOllama(executable, log, signal); return; }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   log('info', 'Downloading the official Ollama Windows installer.');
   const installer = path.join(directory, 'OllamaSetup.exe');
-  const response = await fetch('https://ollama.com/download/OllamaSetup.exe', { signal: AbortSignal.timeout(60 * 60 * 1000) });
+  const response = await fetch('https://ollama.com/download/OllamaSetup.exe', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(60 * 60 * 1000)]) : AbortSignal.timeout(60 * 60 * 1000) });
   if (!response.ok || !response.body) throw new Error(`Ollama download failed: HTTP ${response.status}.`);
   const total = Number(response.headers.get('content-length')) || null;
   let completed = 0, last = 0;
@@ -98,23 +105,26 @@ async function installOllama(directory, log, progress) {
     }
   })());
   await pipeline(stream, createWriteStream(installer));
+  signal?.throwIfAborted();
   log('info', 'Verifying the installer signature and installing Ollama.');
   const script = path.join(directory, 'install-ollama.ps1');
   // The installer path is an argument, never interpolated into shell source.
   await fs.writeFile(script, `param([Parameter(Mandatory=$true)][string]$Installer)\n$ErrorActionPreference = 'Stop'\n$signature = Get-AuthenticodeSignature -LiteralPath $Installer\nif ($signature.Status -ne 'Valid') { throw 'Ollama installer signature validation failed.' }\n$process = Start-Process -FilePath $Installer -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait -PassThru\nif ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) { throw ('Ollama installer exit code: ' + $process.ExitCode) }\n`);
   try { await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Installer', installer]); }
   finally { await fs.rm(script, { force: true }); await fs.rm(installer, { force: true }); }
-  if (!await reachable()) await startOllama(executable, log);
+  if (!await reachable(signal)) await startOllama(executable, log, signal);
 }
-export async function setupRuntime(directory, log, progress) {
+export async function setupRuntime(directory, log, progress, { signal } = {}) {
+  signal?.throwIfAborted();
   await fs.mkdir(directory, { recursive: true });
   log('info', 'Checking the local Ollama installation.');
-  if (!await reachable()) await installOllama(directory, log, progress);
+  if (!await reachable(signal)) await installOllama(directory, log, progress, signal);
   for (const name of ['qwen3-embedding:0.6b', 'llama3.2:1b']) {
-    const tags = await (await ollamaRequest('/api/tags')).json();
+    signal?.throwIfAborted();
+    const tags = await (await ollamaRequest('/api/tags', undefined, { signal })).json();
     if ((tags.models ?? []).some((m) => m.name === name)) { log('success', `${name} is already installed.`); continue; }
     log('info', `Downloading ${name}.`);
-    await pullModel(name, (p) => { progress(p); if (p.percent === null || p.status === 'success') log('info', `${name}: ${p.status}`); });
+    await pullModel(name, (p) => { progress(p); if (p.percent === null || p.status === 'success') log('info', `${name}: ${p.status}`); }, { signal });
   }
   log('success', 'Ollama and the default models are ready.');
 }
